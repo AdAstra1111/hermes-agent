@@ -75,8 +75,26 @@ DEJA_VU_MIN_REPEATS = 3
 GHOST_FRACTION = 0.30
 GHOST_MIN_SESSIONS = 10
 
+# runaway_session: single session's cost vs the window median session cost
+RUNAWAY_COST_MULTIPLIER = 10
+RUNAWAY_MIN_USD = 5.0
+# ...and escalation when one session dominates total window spend
+RUNAWAY_CRITICAL_SHARE = 0.25
+
+# spawn_burst: hourly session starts per source vs that source's own
+# median hourly rate. The relative threshold keeps steady high-volume
+# sources (cron firing all day) from flagging; the floor keeps quiet
+# sources from flagging on trivial counts.
+SPAWN_BURST_MULTIPLIER = 4
+SPAWN_BURST_FLOOR = 30
+
 # How many leading characters of a tool result to scan for error markers.
 _ERROR_SCAN_CHARS = 500
+
+# Failure-ish values of a structured result's "status" field. Guardrail
+# outcomes (blocked, approval_required) are deliberately excluded — they
+# are the system working, not the tool failing.
+_FAILURE_STATUSES = {"error", "failed", "timeout", "disabled"}
 
 _ERROR_MARKERS = (
     "error:",
@@ -94,13 +112,54 @@ _ERROR_MARKERS = (
 
 
 def _looks_like_error(head: Optional[str]) -> bool:
-    """Heuristic: does the start of a tool result read like a failure?"""
+    """Heuristic: does the start of a tool result read like a failure?
+
+    Only used as a fallback for unstructured (non-JSON) results — see
+    :func:`result_failed`. Output text routinely *mentions* errors
+    (compiler logs, grepped tracebacks) without the call having failed,
+    so structured fields always win when present.
+    """
     if not head:
         return False
     h = head.lower()
     if h.startswith("error"):
         return True
     return any(marker in h for marker in _ERROR_MARKERS)
+
+
+def result_failed(row: Dict[str, Any]) -> bool:
+    """Classify one tool-result row as failed or not.
+
+    Structured-first: tools like terminal return JSON
+    ``{"output", "exit_code", "error", "status", ...}``, and the
+    ``output`` field comes first — so its text can mention errors at
+    length while the authoritative verdict sits in the trailing fields.
+    Precedence:
+
+      1. ``exit_code_meaning`` present → the tool itself marked a
+         nonzero exit as benign (grep=1 "no matches") → success.
+      2. ``exit_code`` → failed iff nonzero.
+      3. ``error`` non-null/non-empty → failed.
+      4. ``status`` in a known failure state → failed.
+      5. Valid JSON with none of the above → success.
+      6. Not JSON → fall back to the text-marker heuristic on the head.
+    """
+    if row.get("is_json"):
+        if row.get("exit_code_meaning"):
+            return False
+        exit_code = row.get("exit_code")
+        if exit_code is not None:
+            try:
+                return int(exit_code) != 0
+            except (TypeError, ValueError):
+                return True
+        if row.get("error"):
+            return True
+        status = row.get("status")
+        if status is not None:
+            return str(status).lower() in _FAILURE_STATUSES
+        return False
+    return _looks_like_error(row.get("head"))
 
 
 class OracleEngine:
@@ -150,6 +209,8 @@ class OracleEngine:
         anomalies: List[Dict[str, Any]] = []
         anomalies += self._detect_cost_spike(daily)
         anomalies += self._detect_token_outliers(sessions)
+        anomalies += self._detect_runaway_session(sessions)
+        anomalies += self._detect_spawn_burst(sessions)
         anomalies += self._detect_model_concentration(sessions)
         anomalies += self._detect_cache_unused(sessions)
         anomalies += self._detect_tool_failures(tool_results)
@@ -215,15 +276,30 @@ class OracleEngine:
     # =========================================================================
 
     def _get_tool_results(self, cutoff: float, source: str = None) -> List[Dict]:
-        """Fetch tool-result heads for failure scanning.
+        """Fetch tool results with structured failure fields where present.
 
-        Only the first ``_ERROR_SCAN_CHARS`` chars of each result are
-        pulled so the scan stays cheap on large histories. Results are
-        ordered by session + timestamp so repeat-failure runs can be
-        detected with a single pass.
+        For JSON results (terminal et al.) the authoritative fields
+        (``exit_code``, ``error``, ``status``, ``exit_code_meaning``) are
+        extracted in SQL; for plain-text results only the first
+        ``_ERROR_SCAN_CHARS`` chars are pulled for the fallback marker
+        scan. Ordered by session + timestamp so repeat-failure runs can
+        be detected in a single pass.
         """
         query = f"""SELECT m.session_id, m.tool_name,
-                           substr(m.content, 1, {_ERROR_SCAN_CHARS}) AS head
+                           substr(m.content, 1, {_ERROR_SCAN_CHARS}) AS head,
+                           json_valid(m.content) AS is_json,
+                           CASE WHEN json_valid(m.content)
+                                THEN json_extract(m.content, '$.exit_code')
+                           END AS exit_code,
+                           CASE WHEN json_valid(m.content)
+                                THEN json_extract(m.content, '$.error')
+                           END AS error,
+                           CASE WHEN json_valid(m.content)
+                                THEN json_extract(m.content, '$.status')
+                           END AS status,
+                           CASE WHEN json_valid(m.content)
+                                THEN json_extract(m.content, '$.exit_code_meaning')
+                           END AS exit_code_meaning
                     FROM messages m
                     JOIN sessions s ON s.id = m.session_id
                     WHERE s.started_at >= ? AND m.role = 'tool'
@@ -329,6 +405,104 @@ class OracleEngine:
             worst_tokens=worst_tokens,
         )]
 
+    def _detect_runaway_session(self, sessions: List[Dict]) -> List[Dict]:
+        """One session costing far more than the window median session.
+
+        Cost concentration, not wall-clock duration, is the signal:
+        gateway sessions legitimately stay open (idle) for days, but a
+        single conversation quietly accumulating a large share of spend
+        is a runaway regardless of how long it sat open.
+        """
+        def _cost(s: Dict) -> float:
+            return s.get("actual_cost_usd") or s.get("estimated_cost_usd") or 0
+
+        costs = [_cost(s) for s in sessions if _cost(s) > 0]
+        if len(costs) < 5:
+            return []
+        median = statistics.median(costs)
+        total = sum(costs)
+        threshold = max(median * RUNAWAY_COST_MULTIPLIER, RUNAWAY_MIN_USD)
+        runaways = sorted(
+            (s for s in sessions if _cost(s) >= threshold),
+            key=_cost, reverse=True,
+        )
+        if not runaways:
+            return []
+        worst = runaways[0]
+        worst_cost = _cost(worst)
+        share = worst_cost / total if total else 0
+        start, end = worst.get("started_at"), worst.get("ended_at")
+        hours = (end - start) / 3600 if start and end and end > start else None
+        duration = f", open {hours:.0f}h" if hours else ", still open"
+        return [self._anomaly(
+            "runaway_session",
+            SEVERITY_CRITICAL if share >= RUNAWAY_CRITICAL_SHARE
+            else SEVERITY_WARNING,
+            "Runaway session cost",
+            f"{len(runaways)} session(s) cost >= ${threshold:.2f} "
+            f"(median session: ${median:.2f}). Worst: session "
+            f"{worst['id'][:8]} on {worst.get('source', '?')} at "
+            f"${worst_cost:.2f} — {share:.0%} of window spend{duration}.",
+            "Review the conversation: a long-lived chat accumulating "
+            "context re-reads gets expensive — /compress it, /new it, or "
+            "split the work across fresh sessions.",
+            runaway_count=len(runaways),
+            threshold_usd=round(threshold, 2),
+            median_usd=round(median, 2),
+            worst_session_id=worst["id"],
+            worst_cost_usd=round(worst_cost, 2),
+            share=round(share, 3),
+        )]
+
+    def _detect_spawn_burst(self, sessions: List[Dict]) -> List[Dict]:
+        """Session-creation burst: one source spiking far above its own
+        steady hourly rate.
+
+        Compared per-source against that source's median active-hour
+        rate, so a cron scheduler steadily firing all day never flags —
+        only a deviation from the source's own normal does.
+        """
+        starts_by_source: Dict[str, Dict[int, int]] = defaultdict(
+            lambda: defaultdict(int)
+        )
+        for s in sessions:
+            started = s.get("started_at")
+            if started:
+                starts_by_source[s.get("source") or "unknown"][
+                    int(started // 3600)
+                ] += 1
+
+        anomalies = []
+        for src, hours in sorted(starts_by_source.items()):
+            counts = list(hours.values())
+            median = statistics.median(counts)
+            threshold = max(median * SPAWN_BURST_MULTIPLIER, SPAWN_BURST_FLOOR)
+            bursts = {h: c for h, c in hours.items() if c >= threshold}
+            if not bursts:
+                continue
+            worst_hour, worst_count = max(bursts.items(), key=lambda kv: kv[1])
+            when = datetime.fromtimestamp(
+                worst_hour * 3600, tz=timezone.utc
+            ).strftime("%Y-%m-%d %H:00 UTC")
+            anomalies.append(self._anomaly(
+                "spawn_burst",
+                SEVERITY_WARNING,
+                f"Session spawn burst: {src}",
+                f"{src} started {worst_count} sessions in one hour "
+                f"({when}); its median active-hour rate is {median:.0f}. "
+                f"{len(bursts)} hour(s) exceeded the burst threshold "
+                f"({threshold:.0f}).",
+                "Look for a retrigger loop — a crashing gateway "
+                "reconnecting, a cron job spawning sub-sessions, or a "
+                "subagent fork bomb.",
+                source=src,
+                worst_hour=when,
+                worst_count=worst_count,
+                median_per_hour=median,
+                burst_hours=len(bursts),
+            ))
+        return anomalies
+
     def _detect_model_concentration(self, sessions: List[Dict]) -> List[Dict]:
         """Nearly all spend funneled through a single model."""
         if len(sessions) < MODEL_CONCENTRATION_MIN_SESSIONS:
@@ -381,7 +555,7 @@ class OracleEngine:
         for r in tool_results:
             name = r["tool_name"]
             calls[name] += 1
-            if _looks_like_error(r.get("head")):
+            if result_failed(r):
                 failures[name] += 1
         anomalies = []
         for name, n_calls in sorted(calls.items()):
@@ -417,7 +591,7 @@ class OracleEngine:
         streak_session = None
         streak = 0
         for r in tool_results + [{"session_id": None, "tool_name": None, "head": ""}]:
-            failing = _looks_like_error(r.get("head"))
+            failing = result_failed(r)
             same = (
                 failing
                 and r["session_id"] == streak_session

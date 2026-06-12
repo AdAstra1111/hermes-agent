@@ -4,6 +4,8 @@ import time
 
 import pytest
 
+import json
+
 from hermes_state import SessionDB
 from agent.oracle import (
     OracleEngine,
@@ -13,6 +15,7 @@ from agent.oracle import (
     VERDICT_STABLE,
     VERDICT_UNSTABLE,
     _looks_like_error,
+    result_failed,
 )
 
 
@@ -62,6 +65,68 @@ def test_looks_like_error_negative():
     assert not _looks_like_error("")
     assert not _looks_like_error("Found 3 matches in src/")
     assert not _looks_like_error("ok")
+
+
+# =============================================================================
+# Structured result classification (result_failed)
+# =============================================================================
+
+def _row(content=None, **fields):
+    """Build a tool-result row like _get_tool_results returns."""
+    return {
+        "session_id": "s", "tool_name": "terminal",
+        "head": (content or "")[:500],
+        "is_json": fields.pop("is_json", 1),
+        "exit_code": fields.pop("exit_code", None),
+        "error": fields.pop("error", None),
+        "status": fields.pop("status", None),
+        "exit_code_meaning": fields.pop("exit_code_meaning", None),
+    }
+
+
+def test_structured_success_not_failed():
+    assert not result_failed(_row(exit_code=0))
+
+
+def test_structured_nonzero_exit_failed():
+    assert result_failed(_row(exit_code=1))
+    assert result_failed(_row(exit_code=-1))
+
+
+def test_benign_nonzero_exit_not_failed():
+    # grep=1 "no matches" — the tool marked it benign via exit_code_meaning.
+    assert not result_failed(
+        _row(exit_code=1, exit_code_meaning="no matches found")
+    )
+
+
+def test_error_field_failed():
+    assert result_failed(_row(error="Command timed out"))
+    assert not result_failed(_row(error=None))
+
+
+def test_status_field():
+    assert result_failed(_row(status="error"))
+    assert result_failed(_row(status="timeout"))
+    # Guardrail outcomes are not tool failures.
+    assert not result_failed(_row(status="blocked"))
+    assert not result_failed(_row(status="approval_required"))
+
+
+def test_error_text_in_output_not_failed_when_structured():
+    """The poisoning regression: a successful terminal call whose OUTPUT
+    mentions errors (grepping logs, compiler warnings) must not count."""
+    content = json.dumps({
+        "output": "Error: connection refused\nTraceback (most recent call last)",
+        "exit_code": 0,
+        "error": None,
+    })
+    assert not result_failed(_row(content=content, exit_code=0))
+
+
+def test_plain_text_falls_back_to_marker_heuristic():
+    assert result_failed({"is_json": 0, "head": "Error: no such tool"})
+    assert not result_failed({"is_json": 0, "head": "Found 3 matches"})
 
 
 # =============================================================================
@@ -182,6 +247,84 @@ def test_deja_vu_requires_consecutive_failures(db, engine):
                           tool_name="patch")
     report = engine.generate(days=7)
     assert "deja_vu" not in _codes(report)
+
+
+def test_json_failures_detected_end_to_end(db, engine):
+    """Structured terminal failures stored as JSON trip both detectors."""
+    _make_session(db, "s1", messages=0)
+    failing = json.dumps({"output": "", "exit_code": 127,
+                          "error": "zsh: command not found: foo"})
+    for i in range(6):
+        db.append_message("s1", role="tool", content=failing,
+                          tool_name="terminal")
+    report = engine.generate(days=7)
+    assert "tool_failure_rate" in _codes(report)
+    assert "deja_vu" in _codes(report)
+
+
+def test_json_successes_with_error_text_not_flagged(db, engine):
+    """End-to-end poisoning regression: successful calls whose output
+    contains error text must not inflate the failure rate."""
+    _make_session(db, "s1", messages=0)
+    noisy_success = json.dumps({
+        "output": "grep results:\nerror: handling in foo.py\nError: retry in bar.py",
+        "exit_code": 0,
+        "error": None,
+    })
+    for i in range(8):
+        db.append_message("s1", role="tool", content=noisy_success,
+                          tool_name="terminal")
+    report = engine.generate(days=7)
+    assert "tool_failure_rate" not in _codes(report)
+    assert "deja_vu" not in _codes(report)
+
+
+def test_runaway_session_detected(db, engine):
+    for i in range(6):
+        _make_session(db, f"s{i}", cost=0.50)
+    _make_session(db, "whale", source="telegram", cost=8.0)
+    report = engine.generate(days=7)
+    assert "runaway_session" in _codes(report)
+    anomaly = next(a for a in report["anomalies"]
+                   if a["code"] == "runaway_session")
+    assert anomaly["metrics"]["worst_session_id"] == "whale"
+    # 8.0 of 11.0 total = 73% of window spend — escalates to critical.
+    assert anomaly["severity"] == SEVERITY_CRITICAL
+
+
+def test_no_runaway_when_costs_are_even(db, engine):
+    for i in range(8):
+        _make_session(db, f"s{i}", cost=2.0)
+    report = engine.generate(days=7)
+    assert "runaway_session" not in _codes(report)
+
+
+def test_spawn_burst_detected(db, engine):
+    # Background rate: one session in each of 5 prior hours.
+    for h in range(2, 7):
+        _make_session(db, f"bg{h}", source="telegram", days_ago=h / 24)
+    # Burst: 35 sessions inside the most recent hour.
+    for i in range(35):
+        _make_session(db, f"burst{i}", source="telegram")
+    report = engine.generate(days=7)
+    assert "spawn_burst" in _codes(report)
+    anomaly = next(a for a in report["anomalies"]
+                   if a["code"] == "spawn_burst")
+    assert anomaly["metrics"]["source"] == "telegram"
+    assert anomaly["metrics"]["worst_count"] >= 35
+
+
+def test_steady_high_rate_source_not_flagged(db, engine):
+    # A cron-like source firing 31 sessions/hour, every hour: high but
+    # steady — median equals the rate, so no burst.
+    sid = 0
+    for h in range(6):
+        for i in range(31):
+            sid += 1
+            _make_session(db, f"c{sid}", source="cron", days_ago=h / 24,
+                          messages=2)
+    report = engine.generate(days=7)
+    assert "spawn_burst" not in _codes(report)
 
 
 def test_ghost_sessions_detected(db, engine):
