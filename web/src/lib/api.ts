@@ -547,6 +547,7 @@ export interface OracleReport {
   verdict: OracleVerdict;
   anomalies: OracleAnomaly[];
   daily: OracleDailyEntry[];
+  recorded_cost: number;
   overview: {
     total_sessions?: number;
     total_messages?: number;

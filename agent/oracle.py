@@ -200,11 +200,26 @@ class OracleEngine:
                 "verdict": VERDICT_STABLE,
                 "anomalies": [],
                 "daily": [],
+                "recorded_cost": 0,
             }
 
         sessions = self._insights._get_sessions(cutoff, source)
         tool_results = self._get_tool_results(cutoff, source)
         daily = self._get_daily_trend(cutoff, source)
+
+        # Two cost pipelines exist and must not be conflated:
+        #   - recorded_cost: sums the DB columns (actual_cost_usd, falling
+        #     back to estimated_cost_usd) — what the provider/session
+        #     accounting actually recorded. Every cost-based ANOMALY
+        #     (cost_spike, runaway_session, model_concentration) uses this.
+        #   - overview.estimated_cost (from insights): re-derived from
+        #     token counts x the bundled pricing table, including
+        #     cache-read rates. Useful when DB columns are empty, but it
+        #     can diverge badly for providers with free cache reads.
+        recorded_cost = sum(
+            s.get("actual_cost_usd") or s.get("estimated_cost_usd") or 0
+            for s in sessions
+        )
 
         anomalies: List[Dict[str, Any]] = []
         anomalies += self._detect_cost_spike(daily)
@@ -232,6 +247,7 @@ class OracleEngine:
             "verdict": self._verdict(anomalies),
             "anomalies": anomalies,
             "daily": daily,
+            "recorded_cost": recorded_cost,
         }
 
     @staticmethod
@@ -712,9 +728,23 @@ class OracleEngine:
             f"{g}messages{rst} {o.get('total_messages', 0):<10}"
             f"{g}tokens{rst} {o.get('total_tokens', 0):,}"
         )
-        cost = o.get("estimated_cost")
-        if cost:
-            lines.append(f"  {g}est. cost{rst} ${cost:,.2f}")
+        modeled = o.get("estimated_cost") or 0
+        recorded = report.get("recorded_cost") or 0
+        if recorded:
+            lines.append(f"  {g}recorded cost{rst} ${recorded:,.2f}")
+            # Surface the modeled figure only when it tells a different
+            # story — a silent mix of the two pipelines is misleading.
+            if modeled and not (0.8 <= modeled / recorded <= 1.25):
+                lines.append(
+                    f"  {dg}modeled cost ${modeled:,.2f} — token counts x "
+                    f"pricing table; diverges from recorded (trust "
+                    f"recorded; anomalies use it){rst}"
+                )
+        elif modeled:
+            lines.append(
+                f"  {g}est. cost{rst} ${modeled:,.2f} "
+                f"{dg}(modeled — no recorded costs in DB){rst}"
+            )
 
         models = report.get("models") or []
         if models:

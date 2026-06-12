@@ -378,6 +378,26 @@ def test_report_contains_base_insights(db, engine):
     assert report["daily"][0]["sessions"] == 1
 
 
+def test_recorded_cost_sums_db_columns(db, engine):
+    for i in range(3):
+        _make_session(db, f"s{i}", cost=2.0)
+    _make_session(db, "free", cost=None)
+    report = engine.generate(days=7)
+    assert report["recorded_cost"] == pytest.approx(6.0)
+
+
+def test_terminal_shows_modeled_divergence(db, engine):
+    # Recorded costs exist but the token-derived estimate will differ
+    # wildly (unknown test model has no pricing -> modeled ~0 is hidden,
+    # so check the recorded line is labeled as such).
+    for i in range(3):
+        _make_session(db, f"s{i}", cost=2.0)
+    report = engine.generate(days=7)
+    text = engine.format_terminal(report, color=False)
+    assert "recorded cost" in text
+    assert "$6.00" in text
+
+
 def test_anomalies_sorted_by_severity(db, engine):
     # Critical (tool failures) + info (cache unused) together.
     for i in range(5):

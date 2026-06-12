@@ -398,8 +398,10 @@ export default function OraclePage() {
                   value={formatTokens(report.overview.total_tokens ?? 0)}
                 />
                 <StatBlock
-                  label="Est. Cost"
-                  value={`$${(report.overview.estimated_cost ?? 0).toFixed(2)}`}
+                  label={report.recorded_cost ? "Cost" : "Est. Cost"}
+                  value={`$${(
+                    report.recorded_cost || report.overview.estimated_cost || 0
+                  ).toFixed(2)}`}
                 />
                 <StatBlock
                   label="Hours Jacked In"
