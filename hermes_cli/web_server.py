@@ -2963,6 +2963,31 @@ async def get_models_analytics(days: int = 30):
 
 
 # ---------------------------------------------------------------------------
+# Oracle endpoint — fleet evaluation report ("State of the Matrix")
+# ---------------------------------------------------------------------------
+
+
+@app.get("/api/oracle/report")
+async def get_oracle_report(days: int = 7, source: str = None):
+    """Fleet evaluation report: usage overview + detected anomalies.
+
+    Read-only analysis (see agent/oracle.py). The iteration counter is
+    not advanced here — dashboard polling shouldn't consume iterations;
+    only explicit runs (`hermes oracle`) do.
+    """
+    from hermes_state import SessionDB
+    from agent.oracle import OracleEngine
+
+    db = SessionDB()
+    try:
+        return OracleEngine(db).generate(
+            days=days, source=source, bump_iteration=False
+        )
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
 # /api/pty — PTY-over-WebSocket bridge for the dashboard "Chat" tab.
 #
 # The endpoint spawns the same ``hermes --tui`` binary the CLI uses, behind
@@ -3437,6 +3462,7 @@ _BUILTIN_DASHBOARD_THEMES = [
     {"name": "ember",     "label": "Ember",          "description": "Warm crimson and bronze — forge vibes"},
     {"name": "mono",      "label": "Mono",           "description": "Clean grayscale — minimal and focused"},
     {"name": "cyberpunk", "label": "Cyberpunk",      "description": "Neon green on black — matrix terminal"},
+    {"name": "matrix",    "label": "The Matrix",     "description": "Phosphor green code-rain — there is no spoon"},
     {"name": "rose",      "label": "Rosé",           "description": "Soft pink and warm ivory — easy on the eyes"},
 ]
 

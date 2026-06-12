@@ -159,6 +159,73 @@ export const cyberpunkTheme: DashboardTheme = {
   },
 };
 
+export const matrixTheme: DashboardTheme = {
+  name: "matrix",
+  label: "The Matrix",
+  description: "Phosphor green code-rain — there is no spoon",
+  palette: {
+    background: { hex: "#010401", alpha: 1 },
+    midground: { hex: "#5dff8f", alpha: 1 },
+    foreground: { hex: "#d8ffe5", alpha: 0 },
+    warmGlow: "rgba(0, 255, 102, 0.16)",
+    noiseOpacity: 1.1,
+  },
+  typography: {
+    ...DEFAULT_TYPOGRAPHY,
+    fontSans: `"Share Tech Mono", "JetBrains Mono", ${SYSTEM_MONO}`,
+    fontMono: `"Share Tech Mono", "JetBrains Mono", ${SYSTEM_MONO}`,
+    fontDisplay: `"VT323", "Share Tech Mono", ${SYSTEM_MONO}`,
+    fontUrl:
+      "https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=VT323&family=JetBrains+Mono:wght@400;700&display=swap",
+    letterSpacing: "0.02em",
+  },
+  layout: {
+    ...DEFAULT_LAYOUT,
+    radius: "0",
+  },
+  colorOverrides: {
+    success: "#00ff66",
+    warning: "#cfff45",
+    destructive: "#ff2244",
+    border: "#0c3d1c",
+  },
+  componentStyles: {
+    card: {
+      "box-shadow": "0 0 18px rgba(0, 255, 102, 0.06) inset",
+      border: "1px solid rgba(0, 255, 102, 0.18)",
+    },
+  },
+  // CRT scanlines + a faint phosphor flicker on headings. Both effects are
+  // disabled for users who prefer reduced motion.
+  customCSS: `
+    @media (prefers-reduced-motion: no-preference) {
+      body::after {
+        content: "";
+        position: fixed;
+        inset: 0;
+        z-index: 9999;
+        pointer-events: none;
+        background: repeating-linear-gradient(
+          to bottom,
+          transparent 0px,
+          transparent 2px,
+          rgba(0, 0, 0, 0.12) 3px
+        );
+        mix-blend-mode: multiply;
+      }
+      h1, h2 {
+        animation: matrix-flicker 8s infinite;
+        text-shadow: 0 0 6px rgba(0, 255, 102, 0.45);
+      }
+      @keyframes matrix-flicker {
+        0%, 97%, 100% { opacity: 1; }
+        98% { opacity: 0.86; }
+        99% { opacity: 0.96; }
+      }
+    }
+  `,
+};
+
 export const roseTheme: DashboardTheme = {
   name: "rose",
   label: "Rosé",
@@ -211,5 +278,6 @@ export const BUILTIN_THEMES: Record<string, DashboardTheme> = {
   ember: emberTheme,
   mono: monoTheme,
   cyberpunk: cyberpunkTheme,
+  matrix: matrixTheme,
   rose: roseTheme,
 };

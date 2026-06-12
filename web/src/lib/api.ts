@@ -87,6 +87,8 @@ export const api = {
     fetchJSON<AnalyticsResponse>(`/api/analytics/usage?days=${days}`),
   getModelsAnalytics: (days: number) =>
     fetchJSON<ModelsAnalyticsResponse>(`/api/analytics/models?days=${days}`),
+  getOracleReport: (days: number) =>
+    fetchJSON<OracleReport>(`/api/oracle/report?days=${days}`),
   getConfig: () => fetchJSON<Record<string, unknown>>("/api/config"),
   getDefaults: () => fetchJSON<Record<string, unknown>>("/api/config/defaults"),
   getSchema: () => fetchJSON<{ fields: Record<string, unknown>; category_order: string[] }>("/api/config/schema"),
@@ -499,6 +501,62 @@ export interface AnalyticsResponse {
     summary: AnalyticsSkillsSummary;
     top_skills: AnalyticsSkillEntry[];
   };
+}
+
+export type OracleSeverity = "info" | "warning" | "critical";
+export type OracleVerdict = "stable" | "degraded" | "unstable";
+
+export interface OracleAnomaly {
+  code: string;
+  severity: OracleSeverity;
+  title: string;
+  detail: string;
+  recommendation: string;
+  metrics: Record<string, number | string>;
+}
+
+export interface OracleDailyEntry {
+  day: string;
+  sessions: number;
+  input_tokens: number;
+  output_tokens: number;
+  cost_usd: number;
+}
+
+export interface OracleModelEntry {
+  model: string;
+  sessions: number;
+  total_tokens: number;
+  input_tokens: number;
+  output_tokens: number;
+  estimated_cost?: number;
+}
+
+export interface OraclePlatformEntry {
+  platform: string;
+  sessions: number;
+  messages: number;
+  total_tokens: number;
+}
+
+export interface OracleReport {
+  days: number;
+  empty: boolean;
+  iteration: number;
+  last_run_at: string | null;
+  verdict: OracleVerdict;
+  anomalies: OracleAnomaly[];
+  daily: OracleDailyEntry[];
+  overview: {
+    total_sessions?: number;
+    total_messages?: number;
+    total_tool_calls?: number;
+    total_tokens?: number;
+    estimated_cost?: number;
+    total_hours?: number;
+  };
+  models: OracleModelEntry[];
+  platforms: OraclePlatformEntry[];
 }
 
 export interface ProfileInfo {
