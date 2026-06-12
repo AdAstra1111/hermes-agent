@@ -168,6 +168,130 @@ def result_failed(row: Dict[str, Any]) -> bool:
     return _looks_like_error(row.get("head"))
 
 
+# =============================================================================
+# Remediation dispatch
+# =============================================================================
+#
+# The Oracle itself never fixes anything — but when the user explicitly
+# dispatches an anomaly (dashboard button / API), it builds a
+# self-contained task prompt for a fleet agent (run as a one-shot cron
+# job). The prompt carries the human's click as its authorization, and
+# still instructs the agent to keep risky changes as proposals.
+
+_REMEDIATION_GUARDRAIL = (
+    "Work autonomously, but apply only low-risk, reversible fixes "
+    "(config corrections, credential refresh, compressing or closing "
+    "sessions, restarting a stuck component). For anything destructive "
+    "or architectural, stop and report your proposed fix instead. "
+    "Finish with a short report: root cause, what you changed, what "
+    "you recommend next."
+)
+
+_REMEDIATION_TEMPLATES: Dict[str, str] = {
+    "tool_failure_rate": (
+        "The '{tool}' tool is failing at a {rate_pct}% rate "
+        "({failures} of {calls} calls in the last {days} days). "
+        "Investigate and fix it: pull the error text from several "
+        "recent failing '{tool}' results in the session database, "
+        "identify the root cause (credentials, configuration, dead "
+        "endpoint, broken environment), and repair it. Verify with a "
+        "real call to the tool afterwards."
+    ),
+    "deja_vu": (
+        "Session {session_id} hit {repeats} consecutive '{tool}' "
+        "failures, and {affected_sessions} session(s) show the same "
+        "retry-loop pattern. Open that session's transcript, find the "
+        "exact call that kept failing and why the agent kept retrying "
+        "it, and fix the underlying cause."
+    ),
+    "token_outlier": (
+        "Session {worst_session_id} consumed {worst_tokens} tokens "
+        "(window median is {median}). Inspect it for retry loops or "
+        "oversized accumulated context. If it is a long-lived "
+        "conversation still in use, compress it; if it is abandoned, "
+        "close it. Check the other outlier sessions ({outlier_count} "
+        "total over the threshold) for the same pattern."
+    ),
+    "runaway_session": (
+        "Session {worst_session_id} has cost ${worst_cost_usd} "
+        "({share_pct}% of the window's spend; median session is "
+        "${median_usd}). Review what it is doing, compress its context "
+        "or move its workload to fresh sessions, and do the same for "
+        "the other {runaway_count} session(s) over the ${threshold_usd} "
+        "threshold."
+    ),
+    "cost_spike": (
+        "Recorded spend in the recent half of the window "
+        "(${recent_usd}) is {ratio}x the prior half (${prior_usd}). "
+        "Identify what changed: list the most expensive recent "
+        "sessions with their models, determine whether a model routing "
+        "change or specific sessions drive it, and correct the routing "
+        "if it is unintended."
+    ),
+    "model_concentration": (
+        "{model} accounts for {share_pct}% of estimated spend "
+        "(${cost_usd}). Review which session types actually need it "
+        "and route summarization, triage, and other simple recurring "
+        "work to a cheaper model."
+    ),
+    "cache_unused": (
+        "{input_tokens} input tokens were processed in the window with "
+        "zero prompt-cache reads recorded. Check whether the active "
+        "provider supports prompt caching and enable it if so."
+    ),
+    "ghost_sessions": (
+        "{ghost_count} of {total} sessions ({fraction_pct}%) ended "
+        "with at most one message. Find what spawns them — crashing "
+        "cron jobs, gateway reconnects, or misfiring automations — and "
+        "fix the trigger."
+    ),
+    "spawn_burst": (
+        "The '{source}' platform started {worst_count} sessions in one "
+        "hour ({worst_hour}) against a median rate of "
+        "{median_per_hour}/hour. Find the retrigger loop — a crashing "
+        "process reconnecting, a cron job spawning sub-sessions, or a "
+        "subagent loop — and stop it."
+    ),
+}
+
+
+def build_remediation_prompt(anomaly: Dict[str, Any], days: int = None) -> str:
+    """Build a self-contained fix-task prompt for one anomaly.
+
+    Used by the dispatch endpoint to hand the anomaly to a fleet agent
+    as a one-shot cron job.
+    """
+    metrics = dict(anomaly.get("metrics") or {})
+    # Derived convenience values for the templates.
+    for key in ("rate", "share", "fraction"):
+        if isinstance(metrics.get(key), (int, float)):
+            metrics[f"{key}_pct"] = round(metrics[key] * 100)
+    for key in ("worst_tokens", "median", "input_tokens", "threshold"):
+        if isinstance(metrics.get(key), (int, float)):
+            metrics[key] = f"{metrics[key]:,}"
+    metrics.setdefault("days", days or "recent")
+
+    template = _REMEDIATION_TEMPLATES.get(anomaly.get("code", ""))
+    try:
+        body = template.format(**metrics) if template else None
+    except (KeyError, IndexError):
+        body = None
+    if body is None:
+        # Unknown code or metrics mismatch — fall back to the anomaly's
+        # own words, which are always present.
+        body = (
+            f"{anomaly.get('detail', '')} "
+            f"Suggested direction: {anomaly.get('recommendation', '')}"
+        )
+    return (
+        f"[Oracle dispatch] The fleet evaluation report flagged an "
+        f"anomaly ({anomaly.get('key', anomaly.get('code', 'unknown'))}, "
+        f"severity {anomaly.get('severity', '?')}) and the operator "
+        f"clicked dispatch — you are authorized to investigate and fix "
+        f"it. {body} {_REMEDIATION_GUARDRAIL}"
+    )
+
+
 class OracleEngine:
     """Generates the fleet evaluation report from a SessionDB."""
 

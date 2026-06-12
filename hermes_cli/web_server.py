@@ -2987,6 +2987,93 @@ async def get_oracle_report(days: int = 7, source: str = None):
         db.close()
 
 
+class OracleAckBody(BaseModel):
+    key: str
+    note: str = ""
+
+
+class OracleDispatchBody(BaseModel):
+    key: str
+    days: int = 7
+    deliver: str = ""
+
+
+@app.post("/api/oracle/ack")
+async def ack_oracle_anomaly(body: OracleAckBody):
+    """Acknowledge an active anomaly (demote to info until it worsens)."""
+    from hermes_state import SessionDB
+    from agent.oracle import OracleEngine
+
+    db = SessionDB()
+    try:
+        ack = OracleEngine(db).acknowledge(body.key, note=body.note or None)
+        return {"ok": True, "key": body.key, "ack": ack}
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    finally:
+        db.close()
+
+
+@app.post("/api/oracle/unack")
+async def unack_oracle_anomaly(body: OracleAckBody):
+    """Remove an acknowledgement."""
+    from hermes_state import SessionDB
+    from agent.oracle import OracleEngine
+
+    db = SessionDB()
+    try:
+        if not OracleEngine(db).unacknowledge(body.key):
+            raise HTTPException(status_code=404,
+                                detail=f"No acknowledgement for '{body.key}'")
+        return {"ok": True, "key": body.key}
+    finally:
+        db.close()
+
+
+@app.post("/api/oracle/dispatch")
+async def dispatch_oracle_fix(body: OracleDispatchBody):
+    """Dispatch an active anomaly to a fleet agent as a one-shot job.
+
+    The explicit user action (button click) is the authorization: the
+    Oracle builds a self-contained remediation prompt and schedules it
+    as a one-shot cron job that runs on the next scheduler tick. The
+    cron daemon must be running for the job to execute.
+    """
+    from hermes_state import SessionDB
+    from agent.oracle import OracleEngine, build_remediation_prompt
+    from cron.jobs import create_job, trigger_job
+
+    db = SessionDB()
+    try:
+        report = OracleEngine(db).generate(
+            days=body.days, bump_iteration=False
+        )
+    finally:
+        db.close()
+    anomaly = next(
+        (a for a in report.get("anomalies", []) if a["key"] == body.key), None
+    )
+    if anomaly is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No active anomaly with key '{body.key}'",
+        )
+    prompt = build_remediation_prompt(anomaly, days=body.days)
+    try:
+        job = create_job(
+            prompt=prompt,
+            schedule="1m",
+            name=f"Oracle fix: {body.key}",
+            deliver=body.deliver or None,
+        )
+        trigger_job(job["id"])
+    except Exception as e:
+        _log.exception("POST /api/oracle/dispatch failed")
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"ok": True, "job_id": job["id"], "name": job.get("name"),
+            "prompt": prompt}
+
+
 # ---------------------------------------------------------------------------
 # /api/pty — PTY-over-WebSocket bridge for the dashboard "Chat" tab.
 #

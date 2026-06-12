@@ -15,6 +15,7 @@ from agent.oracle import (
     VERDICT_STABLE,
     VERDICT_UNSTABLE,
     _looks_like_error,
+    build_remediation_prompt,
     result_failed,
 )
 
@@ -453,6 +454,48 @@ def test_terminal_marks_acknowledged(db, engine):
     assert "acknowledged" in text
     assert "known outage" in text
     assert "tool_failure_rate:web_fetch" in text
+
+
+# =============================================================================
+# Remediation prompts
+# =============================================================================
+
+def test_remediation_prompt_for_every_active_anomaly(db, engine):
+    """Every anomaly the engine can emit gets a usable dispatch prompt."""
+    _seed_tool_failures(db)
+    for i in range(2, 8):
+        _make_session(db, f"x{i}", input_tokens=300_000, cost=0.5)
+    _make_session(db, "whale", input_tokens=900_000, cost=8.0)
+    report = engine.generate(days=7)
+    assert report["anomalies"]
+    for anomaly in report["anomalies"]:
+        prompt = build_remediation_prompt(anomaly, days=7)
+        assert "[Oracle dispatch]" in prompt
+        assert anomaly["key"] in prompt
+        # No unformatted template placeholders leaked through.
+        assert "{" not in prompt
+
+
+def test_remediation_prompt_tool_failure_content(db, engine):
+    _seed_tool_failures(db, tool="memory")
+    report = engine.generate(days=7)
+    anomaly = next(a for a in report["anomalies"]
+                   if a["key"] == "tool_failure_rate:memory")
+    prompt = build_remediation_prompt(anomaly, days=7)
+    assert "'memory'" in prompt
+    assert "100%" in prompt
+    assert "reversible" in prompt  # guardrail present
+
+
+def test_remediation_prompt_unknown_code_falls_back():
+    prompt = build_remediation_prompt({
+        "code": "future_code", "key": "future_code", "severity": "warning",
+        "detail": "Something new happened.",
+        "recommendation": "Look into it.",
+        "metrics": {},
+    })
+    assert "Something new happened." in prompt
+    assert "Look into it." in prompt
 
 
 # =============================================================================
