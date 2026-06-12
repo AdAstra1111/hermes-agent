@@ -508,11 +508,18 @@ export type OracleVerdict = "stable" | "degraded" | "unstable";
 
 export interface OracleAnomaly {
   code: string;
+  /** Per-instance handle for acknowledgement, e.g. "tool_failure_rate:memory". */
+  key: string;
   severity: OracleSeverity;
   title: string;
   detail: string;
   recommendation: string;
   metrics: Record<string, number | string>;
+  acknowledged?: boolean;
+  acked_at?: string;
+  ack_note?: string;
+  ack_stale?: boolean;
+  computed_severity?: OracleSeverity;
 }
 
 export interface OracleDailyEntry {

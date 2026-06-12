@@ -365,6 +365,97 @@ def test_cost_spike_detected(db, engine):
 
 
 # =============================================================================
+# Acknowledgements
+# =============================================================================
+
+def _seed_tool_failures(db, sid="s1", tool="web_fetch", n=6):
+    _make_session(db, sid, messages=0)
+    for i in range(n):
+        db.append_message(sid, role="tool", content="Error: down",
+                          tool_name=tool)
+
+
+def test_ack_demotes_to_info_and_clears_verdict(db, engine):
+    _seed_tool_failures(db)
+    report = engine.generate(days=7)
+    assert report["verdict"] == VERDICT_UNSTABLE
+
+    engine.acknowledge("tool_failure_rate:web_fetch", note="known outage")
+    engine.acknowledge("deja_vu:web_fetch")
+    report = engine.generate(days=7)
+    assert report["verdict"] == VERDICT_STABLE
+    acked = next(a for a in report["anomalies"]
+                 if a["key"] == "tool_failure_rate:web_fetch")
+    assert acked["acknowledged"] is True
+    assert acked["severity"] == "info"
+    assert acked["computed_severity"] == SEVERITY_CRITICAL
+    assert acked["ack_note"] == "known outage"
+
+
+def test_ack_is_per_instance_key(db, engine):
+    _seed_tool_failures(db, sid="s1", tool="web_fetch")
+    _seed_tool_failures(db, sid="s2", tool="memory")
+    engine.acknowledge("tool_failure_rate:memory")
+    report = engine.generate(days=7)
+    by_key = {a["key"]: a for a in report["anomalies"]}
+    assert by_key["tool_failure_rate:memory"]["severity"] == "info"
+    assert by_key["tool_failure_rate:web_fetch"]["severity"] == SEVERITY_CRITICAL
+    assert report["verdict"] == VERDICT_UNSTABLE
+
+
+def test_ack_unknown_key_raises(db, engine):
+    _make_session(db, "s1")
+    with pytest.raises(ValueError, match="No active anomaly"):
+        engine.acknowledge("cost_spike")
+
+
+def test_ack_reactivates_when_numbers_worsen(db, engine):
+    _seed_tool_failures(db, n=6)
+    engine.acknowledge("tool_failure_rate:web_fetch")
+    # Failures grow 6 -> 12 (>= 1.5x the ack snapshot) — ack goes stale.
+    for i in range(6):
+        db.append_message("s1", role="tool", content="Error: down",
+                          tool_name="web_fetch")
+    report = engine.generate(days=7)
+    anomaly = next(a for a in report["anomalies"]
+                   if a["key"] == "tool_failure_rate:web_fetch")
+    assert anomaly.get("ack_stale") is True
+    assert not anomaly.get("acknowledged")
+    assert anomaly["severity"] == SEVERITY_CRITICAL
+    assert report["verdict"] == VERDICT_UNSTABLE
+
+
+def test_unack_restores_severity(db, engine):
+    _seed_tool_failures(db)
+    engine.acknowledge("tool_failure_rate:web_fetch")
+    assert engine.unacknowledge("tool_failure_rate:web_fetch") is True
+    assert engine.unacknowledge("tool_failure_rate:web_fetch") is False
+    report = engine.generate(days=7)
+    anomaly = next(a for a in report["anomalies"]
+                   if a["key"] == "tool_failure_rate:web_fetch")
+    assert anomaly["severity"] == SEVERITY_CRITICAL
+
+
+def test_acks_persist_across_engine_instances(db, engine):
+    _seed_tool_failures(db)
+    engine.acknowledge("tool_failure_rate:web_fetch", note="vendor incident")
+    fresh = OracleEngine(db)
+    acks = fresh.get_acknowledgements()
+    assert "tool_failure_rate:web_fetch" in acks
+    assert acks["tool_failure_rate:web_fetch"]["note"] == "vendor incident"
+
+
+def test_terminal_marks_acknowledged(db, engine):
+    _seed_tool_failures(db)
+    engine.acknowledge("tool_failure_rate:web_fetch", note="known outage")
+    report = engine.generate(days=7)
+    text = engine.format_terminal(report, color=False)
+    assert "acknowledged" in text
+    assert "known outage" in text
+    assert "tool_failure_rate:web_fetch" in text
+
+
+# =============================================================================
 # Report shape + rendering
 # =============================================================================
 

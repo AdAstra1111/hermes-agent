@@ -34,6 +34,12 @@ from agent.insights import InsightsEngine
 # state_meta keys for run bookkeeping
 _META_ITERATION = "oracle_iteration"
 _META_LAST_RUN = "oracle_last_run_at"
+_META_ACKS = "oracle_acks"
+
+# An acknowledged anomaly reactivates when any shared numeric metric grows
+# to this multiple of its value at ack time ("the numbers materially
+# changed").
+ACK_STALE_MULTIPLIER = 1.5
 
 # Severity levels, in escalation order.
 SEVERITY_INFO = "info"
@@ -231,6 +237,7 @@ class OracleEngine:
         anomalies += self._detect_tool_failures(tool_results)
         anomalies += self._detect_deja_vu(tool_results)
         anomalies += self._detect_ghost_sessions(sessions)
+        self._apply_acknowledgements(anomalies)
         anomalies.sort(
             key=lambda a: _SEVERITY_RANK.get(a["severity"], 0), reverse=True
         )
@@ -261,6 +268,103 @@ class OracleEngine:
         if worst >= _SEVERITY_RANK[SEVERITY_WARNING]:
             return VERDICT_DEGRADED
         return VERDICT_STABLE
+
+    # =========================================================================
+    # Acknowledgements
+    # =========================================================================
+    #
+    # An acknowledged anomaly ("yes, I know — that was a decision") is
+    # demoted to info so it stops driving the verdict, but stays visible.
+    # It reactivates automatically when the numbers materially change:
+    # any numeric metric growing to ACK_STALE_MULTIPLIER x its value at
+    # ack time. Acks are keyed by the anomaly's per-instance `key`
+    # (e.g. "cost_spike", "tool_failure_rate:memory").
+
+    def get_acknowledgements(self) -> Dict[str, Dict[str, Any]]:
+        raw = self.db.get_meta(_META_ACKS)
+        if not raw:
+            return {}
+        try:
+            acks = json.loads(raw)
+            return acks if isinstance(acks, dict) else {}
+        except (json.JSONDecodeError, TypeError):
+            return {}
+
+    def _save_acknowledgements(self, acks: Dict[str, Dict[str, Any]]) -> None:
+        self.db.set_meta(_META_ACKS, json.dumps(acks))
+
+    def acknowledge(self, key: str, note: str = None) -> Dict[str, Any]:
+        """Acknowledge a currently-active anomaly by its key.
+
+        Snapshots the anomaly's metrics so material worsening can
+        reactivate it. Raises ValueError if no active anomaly matches —
+        acknowledging something that isn't firing would be a silent
+        no-op trap.
+        """
+        report = self.generate(bump_iteration=False)
+        match = next(
+            (a for a in report.get("anomalies", []) if a["key"] == key), None
+        )
+        if match is None:
+            active = ", ".join(a["key"] for a in report.get("anomalies", []))
+            raise ValueError(
+                f"No active anomaly with key '{key}'. "
+                f"Active: {active or '(none)'}"
+            )
+        acks = self.get_acknowledgements()
+        acks[key] = {
+            "acked_at": datetime.now(timezone.utc).isoformat(),
+            "note": note,
+            "metrics": {
+                k: v for k, v in match.get("metrics", {}).items()
+                if isinstance(v, (int, float)) and not isinstance(v, bool)
+            },
+        }
+        self._save_acknowledgements(acks)
+        return acks[key]
+
+    def unacknowledge(self, key: str) -> bool:
+        """Remove an acknowledgement. Returns False if it didn't exist."""
+        acks = self.get_acknowledgements()
+        if key not in acks:
+            return False
+        del acks[key]
+        self._save_acknowledgements(acks)
+        return True
+
+    @staticmethod
+    def _ack_is_stale(ack: Dict[str, Any], anomaly: Dict[str, Any]) -> bool:
+        """Has the anomaly worsened materially since it was acknowledged?"""
+        snapshot = ack.get("metrics") or {}
+        current = anomaly.get("metrics") or {}
+        for k, snap in snapshot.items():
+            cur = current.get(k)
+            if not isinstance(cur, (int, float)) or isinstance(cur, bool):
+                continue
+            if not isinstance(snap, (int, float)) or snap <= 0:
+                continue
+            if cur >= snap * ACK_STALE_MULTIPLIER:
+                return True
+        return False
+
+    def _apply_acknowledgements(self, anomalies: List[Dict[str, Any]]) -> None:
+        """Demote acknowledged anomalies in place (or mark stale acks)."""
+        acks = self.get_acknowledgements()
+        if not acks:
+            return
+        for a in anomalies:
+            ack = acks.get(a["key"])
+            if ack is None:
+                continue
+            if self._ack_is_stale(ack, a):
+                a["ack_stale"] = True
+                continue
+            a["acknowledged"] = True
+            a["acked_at"] = ack.get("acked_at")
+            if ack.get("note"):
+                a["ack_note"] = ack["note"]
+            a["computed_severity"] = a["severity"]
+            a["severity"] = SEVERITY_INFO
 
     # =========================================================================
     # Run bookkeeping (iteration counter in state_meta)
@@ -352,8 +456,12 @@ class OracleEngine:
     @staticmethod
     def _anomaly(code: str, severity: str, title: str, detail: str,
                  recommendation: str, **metrics) -> Dict[str, Any]:
+        # Some codes fire once per tool/source; the key is the stable
+        # per-instance handle used for acknowledgement.
+        qualifier = metrics.get("tool") or metrics.get("source")
         return {
             "code": code,
+            "key": f"{code}:{qualifier}" if qualifier else code,
             "severity": severity,
             "title": title,
             "detail": detail,
@@ -764,9 +872,19 @@ class OracleEngine:
                          f"{len(anomalies)} detected{rst}")
             for a in anomalies:
                 c = sev_color.get(a["severity"], dg)
-                lines.append(f"  {c}{b}▲ [{a['severity'].upper()}] "
-                             f"{a['title']}{rst}")
+                marker = "✔" if a.get("acknowledged") else "▲"
+                suffix = f"  {dg}[{a['key']}]{rst}"
+                if a.get("acknowledged"):
+                    acked = (a.get("acked_at") or "")[:10]
+                    suffix += f" {dg}acknowledged {acked}{rst}"
+                elif a.get("ack_stale"):
+                    suffix += (f" {y}ack stale — numbers worsened since "
+                               f"acknowledged{rst}")
+                lines.append(f"  {c}{b}{marker} [{a['severity'].upper()}] "
+                             f"{a['title']}{rst}{suffix}")
                 lines.append(f"    {dg}{a['detail']}{rst}")
+                if a.get("ack_note"):
+                    lines.append(f"    {dg}ack note: {a['ack_note']}{rst}")
                 lines.append(f"    {g}→ {a['recommendation']}{rst}")
         else:
             lines.append(f"  {dg}No anomalies. Déjà vu has not been "

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useState } from "react";
-import { AlertTriangle, Eye, RefreshCw } from "lucide-react";
+import { AlertTriangle, CheckCircle2, Eye, RefreshCw } from "lucide-react";
 import { api } from "@/lib/api";
 import type {
   OracleAnomaly,
@@ -111,10 +111,17 @@ function AnomalyCard({ anomaly }: { anomaly: OracleAnomaly }) {
   return (
     <div
       className="flex flex-col gap-1.5 border-l-2 py-2 pl-4"
-      style={{ borderColor: color }}
+      style={{ borderColor: color, opacity: anomaly.acknowledged ? 0.55 : 1 }}
     >
       <div className="flex flex-wrap items-center gap-2">
-        <AlertTriangle className="h-3.5 w-3.5 shrink-0" style={{ color }} />
+        {anomaly.acknowledged ? (
+          <CheckCircle2
+            className="h-3.5 w-3.5 shrink-0"
+            style={{ color: PHOSPHOR_DIM }}
+          />
+        ) : (
+          <AlertTriangle className="h-3.5 w-3.5 shrink-0" style={{ color }} />
+        )}
         <span className="font-mono text-sm font-semibold" style={{ color }}>
           {anomaly.title}
         </span>
@@ -124,16 +131,41 @@ function AnomalyCard({ anomaly }: { anomaly: OracleAnomaly }) {
         >
           {anomaly.severity}
         </Badge>
+        {anomaly.acknowledged && (
+          <Badge
+            tone="secondary"
+            className="font-mono text-[9px] uppercase tracking-widest"
+          >
+            acknowledged {(anomaly.acked_at ?? "").slice(0, 10)}
+          </Badge>
+        )}
+        {anomaly.ack_stale && (
+          <Badge
+            tone="secondary"
+            className="font-mono text-[9px] uppercase tracking-widest"
+            style={{ color: SEVERITY_COLORS.warning }}
+          >
+            ack stale — worsened
+          </Badge>
+        )}
         <span
           className="font-mono text-[10px]"
           style={{ color: PHOSPHOR_DIM }}
         >
-          {anomaly.code}
+          {anomaly.key}
         </span>
       </div>
       <p className="font-mono text-xs" style={{ color: PHOSPHOR_DIM }}>
         {anomaly.detail}
       </p>
+      {anomaly.ack_note && (
+        <p
+          className="font-mono text-xs italic"
+          style={{ color: PHOSPHOR_DIM }}
+        >
+          ack note: {anomaly.ack_note}
+        </p>
+      )}
       <p className="font-mono text-xs" style={{ color: PHOSPHOR }}>
         → {anomaly.recommendation}
       </p>
