@@ -89,6 +89,27 @@ export const api = {
     fetchJSON<ModelsAnalyticsResponse>(`/api/analytics/models?days=${days}`),
   getOracleReport: (days: number) =>
     fetchJSON<OracleReport>(`/api/oracle/report?days=${days}`),
+  ackOracleAnomaly: (key: string, note = "") =>
+    fetchJSON<{ ok: boolean }>("/api/oracle/ack", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ key, note }),
+    }),
+  unackOracleAnomaly: (key: string) =>
+    fetchJSON<{ ok: boolean }>("/api/oracle/unack", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ key }),
+    }),
+  dispatchOracleFix: (key: string, days: number) =>
+    fetchJSON<{ ok: boolean; job_id: string; prompt: string }>(
+      "/api/oracle/dispatch",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ key, days }),
+      },
+    ),
   getConfig: () => fetchJSON<Record<string, unknown>>("/api/config"),
   getDefaults: () => fetchJSON<Record<string, unknown>>("/api/config/defaults"),
   getSchema: () => fetchJSON<{ fields: Record<string, unknown>; category_order: string[] }>("/api/config/schema"),

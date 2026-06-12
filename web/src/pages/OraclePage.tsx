@@ -106,8 +106,49 @@ function VerdictBanner({ report }: { report: OracleReport }) {
   );
 }
 
-function AnomalyCard({ anomaly }: { anomaly: OracleAnomaly }) {
+function AnomalyCard({
+  anomaly,
+  days,
+  onChanged,
+}: {
+  anomaly: OracleAnomaly;
+  days: number;
+  onChanged: () => void;
+}) {
   const color = SEVERITY_COLORS[anomaly.severity] ?? PHOSPHOR_DIM;
+  const [busy, setBusy] = useState<"ack" | "dispatch" | null>(null);
+  const [dispatchedJob, setDispatchedJob] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
+
+  const toggleAck = async () => {
+    setBusy("ack");
+    setActionError(null);
+    try {
+      if (anomaly.acknowledged) {
+        await api.unackOracleAnomaly(anomaly.key);
+      } else {
+        await api.ackOracleAnomaly(anomaly.key);
+      }
+      onChanged();
+    } catch (err) {
+      setActionError(String(err));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const dispatchFix = async () => {
+    setBusy("dispatch");
+    setActionError(null);
+    try {
+      const res = await api.dispatchOracleFix(anomaly.key, days);
+      setDispatchedJob(res.job_id);
+    } catch (err) {
+      setActionError(String(err));
+    } finally {
+      setBusy(null);
+    }
+  };
   return (
     <div
       className="flex flex-col gap-1.5 border-l-2 py-2 pl-4"
@@ -169,6 +210,42 @@ function AnomalyCard({ anomaly }: { anomaly: OracleAnomaly }) {
       <p className="font-mono text-xs" style={{ color: PHOSPHOR }}>
         → {anomaly.recommendation}
       </p>
+      <div className="mt-1 flex flex-wrap items-center gap-2">
+        <Button
+          type="button"
+          size="sm"
+          outlined
+          onClick={toggleAck}
+          disabled={busy !== null}
+          prefix={busy === "ack" ? <Spinner /> : undefined}
+        >
+          {anomaly.acknowledged ? "Unacknowledge" : "Acknowledge"}
+        </Button>
+        {dispatchedJob ? (
+          <span
+            className="font-mono text-[11px]"
+            style={{ color: PHOSPHOR }}
+          >
+            ✔ agent dispatched — cron job {dispatchedJob}
+          </span>
+        ) : (
+          <Button
+            type="button"
+            size="sm"
+            outlined
+            onClick={dispatchFix}
+            disabled={busy !== null}
+            prefix={busy === "dispatch" ? <Spinner /> : undefined}
+          >
+            Dispatch agent
+          </Button>
+        )}
+        {actionError && (
+          <span className="font-mono text-[11px] text-destructive">
+            {actionError}
+          </span>
+        )}
+      </div>
     </div>
   );
 }
@@ -461,7 +538,12 @@ export default function OraclePage() {
                   </p>
                 ) : (
                   report.anomalies.map((a, i) => (
-                    <AnomalyCard key={`${a.code}-${i}`} anomaly={a} />
+                    <AnomalyCard
+                      key={`${a.key}-${i}`}
+                      anomaly={a}
+                      days={days}
+                      onChanged={load}
+                    />
                   ))
                 )}
               </CardContent>
