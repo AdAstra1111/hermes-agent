@@ -10105,6 +10105,28 @@ Examples:
         logging.getLogger(__name__).debug("curator CLI wiring failed: %s", _exc)
 
     # =========================================================================
+    # oracle command — fleet evaluation report ("State of the Matrix")
+    # =========================================================================
+    oracle_parser = subparsers.add_parser(
+        "oracle",
+        help="Fleet evaluation report — usage overview + detected anomalies",
+        description=(
+            "The Oracle is a read-only analysis pass over the session "
+            "state database. It aggregates usage across every platform "
+            "and model, scans recent trajectories for failure signals "
+            "(repeated tool errors, token-burn outliers, cost spikes), "
+            "and prints a 'State of the Matrix' report with "
+            "recommendations. It never modifies configuration or skills."
+        ),
+    )
+    try:
+        from hermes_cli.oracle import register_cli as _register_oracle_cli
+
+        _register_oracle_cli(oracle_parser)
+    except Exception as _exc:
+        logging.getLogger(__name__).debug("oracle CLI wiring failed: %s", _exc)
+
+    # =========================================================================
     # memory command
     # =========================================================================
     memory_parser = subparsers.add_parser(
